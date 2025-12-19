@@ -1,4 +1,4 @@
-# Multidimensional Marine Heatwave Detector (Xarray + Dask) (XMHW)
+# Multidimensional Marine Heatwave Detector (Xarray + Dask) (xmhw)
 
 A high-performance, parallelized Python implementation of the Marine Heatwave (MHW) detection definitions proposed by [Hobday et al. (2016)](https://doi.org/10.1016/j.pocean.2015.12.014).
 
