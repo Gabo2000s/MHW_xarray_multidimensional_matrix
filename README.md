@@ -34,9 +34,14 @@ pip install -r requirements.txt
 ⚙️ Input Specifications
 The script expects a NetCDF file with the following characteristics:
 
-Time: Must be a datetime object. The script handles daily resolution.
-Space: Standard latitude and longitude. Optional depth dimension for volumetric data.
-Temperature: Sea surface temperature (SST), Conservative or Potential Temperature (°C or K)
+| Dimension | Description |
+| :--- | :--- |
+| **Time** | Must be a datetime object. The script handles daily resolution. |
+| **Space** | Standard `latitude` and `longitude`. Optional `depth` dimension for volumetric data. |
+
+| Variable | Description | Units |
+| :--- | :--- | :--- |
+| **Temperature** | Sea Surface Temperature (SST)/Potential Temperature. | °C or K |
 
 🖥 Usage
 Open mhw_detector.py.
@@ -60,36 +65,33 @@ python mhw_detector.py
 📊 Output Specifications
 The output is a NetCDF file containing the computed MHW metrics. The data is masked: grid points without an active MHW event are filled with NaN.
 
-Variable,Name in NetCDF,Description,Units
-Intensity,mhw_intensity,Temperature anomaly above climatology during the event.,°C
-Max Intensity,mhw_max_intensity,The highest anomaly recorded during the event duration.,°C
-Cumulative Intensity,mhw_cum_intensity,Integrated intensity over the duration of the event.,°C days
-Duration,mhw_duration,Length of the MHW event.,Days
-Category,mhw_category,"Severity category (1=Moderate, 2=Strong, 3=Severe...).",Unitless
+| Variable | Name in NetCDF | Description | Units |
+| :--- | :--- | :--- | :--- |
+| **Intensity** | `mhw_intensity` | Temperature anomaly above climatology during the event. | °C |
+| **Max Intensity** | `mhw_max_intensity` | The highest anomaly recorded during the event duration. | °C |
+| **Cumulative Intensity** | `mhw_cum_intensity` | Integrated intensity over the duration of the event. | °C days |
+| **Duration** | `mhw_duration` | Length of the MHW event. | Days |
+| **Category** | `mhw_category` | Severity category (1=Moderate, 2=Strong, 3=Severe...). | Unitless |
 
-🔬 Methodology
-1. Scientific Definition
-The algorithm follows the hierarchical definition by Hobday et al. (2016):
+## 🔬 Methodology
 
-Climatology: Calculated over a user-defined baseline (default 1993-2022) using an 11-day centered window.
+### Scientific Definition
+The algorithm follows the hierarchical definition by **Hobday et al. (2016)**:
 
-Threshold: The 90th percentile of the baseline temperatures.
+* **Climatology:** Calculated over a user-defined baseline (default 1993-2022) using an 11-day centered window.
+* **Threshold:** The 90th percentile of the baseline temperatures.
+* **Event:** Periods where temperature exceeds the threshold for at least 5 consecutive days.
+* **Gaps:** Events broken by gaps of less than 3 days are merged.
 
-Event: Periods where temperature exceeds the threshold for at least 5 consecutive days.
+### Technical Implementation
+* **Chunking:** The data is chunked using `Dask` to allow processing of datasets larger than RAM.
+* **Core Logic:** The detection function (`detect_mhw_core`) is a pure `NumPy` implementation optimized for 1D arrays.
+* **Wrapper:** `xarray.apply_ufunc` maps this 1D function across the **Time** dimension of the N-dimensional input array, effectively looping over `Lat`, `Lon`, and `Depth` in C-speed (vectorized).
 
-Gaps: Events broken by gaps of less than 3 days are merged.
-
-2. Technical Implementation
-Chunking: The data is chunked using Dask to allow processing of datasets larger than RAM.
-
-Core Logic: The detection function (detect_mhw_core) is a pure NumPy implementation optimized for 1D arrays.
-
-Wrapper: xarray.apply_ufunc maps this 1D function across the Time dimension of the N-dimensional input array, effectively looping over Lat, Lon, and Depth in C-speed (vectorized).
-
-📄 License
+## 📄 License
 Distributed under the MIT License. See LICENSE for more information.
 
-📚 References
+## 📚 References
 Hobday, A. J., et al. (2016). A hierarchical approach to defining marine heatwaves. Progress in Oceanography, 141, 227-238. DOI: 10.1016/j.pocean.2015.12.014
 
 Schlegel, R. W., & Smit, A. J. (2018). marineHeatWaves: Detecting and analyzing marine heatwaves. Journal of Open Source Software, 3(27), 812.
