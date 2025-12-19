@@ -1,4 +1,4 @@
-# Multidimensional Marine Heatwave Detector (Xarray + Dask)
+# Multidimensional Marine Heatwave Detector (Xarray + Dask) (XMHW)
 
 A high-performance, parallelized Python implementation of the Marine Heatwave (MHW) detection definitions proposed by [Hobday et al. (2016)](https://doi.org/10.1016/j.pocean.2015.12.014).
 
@@ -44,7 +44,7 @@ The script expects a NetCDF file with the following characteristics:
 | **Temperature** | Sea Surface Temperature (SST)/Potential Temperature. | °C or K |
 
 ## 🖥 Usage
-Open mhw_detector.py.
+Open xmhw.py.
 
 Edit the CONFIGURATION section at the bottom of the script:
 
@@ -59,7 +59,7 @@ CLIM_END = 2022
 
 Run the script:
 ```bash
-python mhw_detector.py
+python xmhw.py
 ```
 
 📊 Output Specifications
