@@ -43,7 +43,7 @@ The script expects a NetCDF file with the following characteristics:
 | :--- | :--- | :--- |
 | **Temperature** | Sea Surface Temperature (SST)/Potential Temperature. | °C or K |
 
-🖥 Usage
+## 🖥 Usage
 Open mhw_detector.py.
 
 Edit the CONFIGURATION section at the bottom of the script:
