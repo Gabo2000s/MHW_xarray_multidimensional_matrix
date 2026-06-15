@@ -28,6 +28,32 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 # 1. CORE SCIENTIFIC LOGIC (Numpy/Pandas based)
 # =============================================================================
 
+def _filter_min_duration(events, n_events, min_duration):
+    """Set to 0 every labeled event shorter than `min_duration` (vectorized)."""
+    if n_events == 0:
+        return events
+    counts = np.bincount(events.ravel())
+    too_short = np.nonzero(counts < min_duration)[0]
+    too_short = too_short[too_short != 0]  # never drop the background label
+    if too_short.size:
+        events = np.where(np.isin(events, too_short), 0, events)
+    return events
+
+
+def _bridge_gaps(mask, max_gap):
+    """Fill interior False runs of length <= `max_gap` so the flanking True
+    runs become a single continuous event. Leading/trailing gaps are never
+    filled (there is nothing to join them to)."""
+    mask = mask.copy()
+    gaps, n_gaps = ndimage.label(~mask)
+    if n_gaps:
+        for sl in ndimage.find_objects(gaps):
+            start, stop = sl[0].start, sl[0].stop
+            if (stop - start) <= max_gap and start > 0 and stop < len(mask):
+                mask[start:stop] = True
+    return mask
+
+
 def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window_half_width=5, 
                     smooth_pctile=True, smooth_width=31, min_duration=5, 
                     join_across_gaps=True, max_gap=2, cold_spells=False,
@@ -38,9 +64,14 @@ def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window
     Based on Hobday et al. (2016) marine heatwave definition. Edited and optimized from 
     https://github.com/ecjoliver/marineHeatWaves
     
-    This version includes a vectorized 'gap filling' mechanism that physically joins 
-    events separated by 'max_gap' days or less before applying the duration filter, 
-    ensuring fragmented events are correctly identified.
+    This version reproduces the reference marineHeatWaves implementation
+    (Oliver, https://github.com/ecjoliver/marineHeatWaves) bit-for-bit in its
+    default configuration. Gap handling is selectable via `join_method`:
+      - 'post-filter' (DEFAULT, = Hobday/Oliver): apply the minimum-duration
+        filter first, then join surviving events separated by <= `max_gap` days.
+      - 'pre-filter' (xrMHW option): join short gaps BEFORE the duration filter,
+        so a fragmented long event survives as one. This is a deliberate,
+        documented departure from Hobday/Oliver, not the default.
 
     Parameters
     ----------
@@ -64,6 +95,9 @@ def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window
         Whether to join events separated by a gap of `max_gap` days or less (default True).
     max_gap : int
         Maximum gap length (in days) allowed to join MHWs (default 2 days).
+    join_method : {'post-filter', 'pre-filter'}
+        Order of gap-joining relative to the duration filter (default
+        'post-filter', which matches Hobday/Oliver). See summary above.
     cold_spells : bool, optional
         If True, detects cold spells (temp < threshold). Default False.
         
@@ -103,21 +137,25 @@ def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window
     thresh_clim_year = np.full(366, np.nan)
     seas_clim_year = np.full(366, np.nan)
     
-    # Calculate threshold and climatology for each day of year (1-366)
+    # Calculate threshold and climatology for each day of year (1-366).
+    # Windowing matches Oliver/Hobday exactly: for each occurrence of day-of-year
+    # `d` in the baseline, pool the +/- window_half_width CONSECUTIVE calendar days
+    # around it (index-space window), across all baseline years. This naturally
+    # includes Feb-29 data in neighbouring windows, unlike a DOY-value window.
+    clim_idx = np.flatnonzero(clim_mask)
+    cs, ce = clim_idx[0], clim_idx[-1]
+    offsets = np.arange(-window_half_width, window_half_width + 1)
     for d in range(1, 367):
-        if d == 60: continue # Skip Feb 29 logic placeholder initially
-        
-        # Define window (circular)
-        window_days = np.arange(d - window_half_width, d + window_half_width + 1)
-        window_days = ((window_days - 1) % 366) + 1
-        window_days = window_days[window_days != 60] # Exclude Feb 29 from window logic
-        
-        in_window = np.isin(doy_clim, window_days)
-        data_in_window = temp_clim[in_window]
-        
-        if len(data_in_window) > 0:
-            thresh_clim_year[d-1] = np.nanpercentile(data_in_window, pctile)
-            seas_clim_year[d-1] = np.nanmean(data_in_window)
+        if d == 60:
+            continue  # Feb 29 handled by interpolation below
+        occ = np.flatnonzero(doy[cs:ce + 1] == d)
+        if occ.size == 0:  # day-of-year absent (e.g. 360-day calendars)
+            continue
+        tt = (cs + occ[:, None] + offsets[None, :]).ravel()
+        tt = tt[(tt >= 0) & (tt < T)]
+        data_in_window = temp[tt]
+        thresh_clim_year[d - 1] = np.nanpercentile(data_in_window, pctile)
+        seas_clim_year[d - 1] = np.nanmean(data_in_window)
 
     # Interpolate Feb 29 (DOY 60)
     thresh_clim_year[59] = 0.5 * thresh_clim_year[58] + 0.5 * thresh_clim_year[60]
@@ -145,59 +183,25 @@ def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window
         exceed_bool = temp < clim_thresh
     else:
         exceed_bool = temp > clim_thresh
+    # NaN climatology days (e.g. absent DOYs) must never count as exceedances.
+    exceed_bool = np.asarray(exceed_bool) & ~np.isnan(clim_thresh)
 
-    # Physic union before filtering (original architechture xrMHW) ---
     if join_across_gaps and join_method == 'pre-filter':
-        gaps_label, n_gaps = ndimage.label(~exceed_bool)
-        if n_gaps > 0:
-            gap_slices = ndimage.find_objects(gaps_label)
-            for sl in gap_slices:
-                gap_len = sl[0].stop - sl[0].start
-                if gap_len <= max_gap and (sl[0].start > 0) and (sl[0].stop < len(temp)):
-                    exceed_bool[sl] = True
-
-    # Tag initial events
-    events, n_events = ndimage.label(exceed_bool)
-
-    # Filter minimmum duration
-    for ev in range(1, n_events + 1):
-        if (events == ev).sum() < min_duration:
-            events[events == ev] = 0
-
-    # Post-filter union (Similar to Oliver 2015) ---
-    if join_across_gaps and join_method == 'post-filter':
-    # 1. Re-etiquetamos solo los eventos que sobrevivieron al filtro de 5 días
-        events, n_events = ndimage.label(events > 0)
-        
-        if n_events > 1:
-            ev_slices = ndimage.find_objects(events)
-            # Iteramos de atrás hacia adelante para no corromper los índices al unir
-            for i in range(len(ev_slices) - 1, 0, -1):
-                # gap_start es el 'stop' del evento anterior (primer índice del gap)
-                gap_start = ev_slices[i-1][0].stop 
-                # gap_end es el 'start' del evento actual (índice donde termina el gap)
-                gap_end = ev_slices[i][0].start
-                
-                # El número de días entre eventos es simplemente la resta
-                gap_len = gap_end - gap_start 
-                
-                if gap_len <= max_gap:
-                    # Unimos físicamente rellenando con True en la máscara original
-                    exceed_bool[gap_start:gap_end] = True
-            
-            # 2. Consolidamos: Re-etiquetamos y aplicamos el filtro de duración final
-            events, n_events = ndimage.label(exceed_bool)
-            for ev in range(1, n_events + 1):
-                if (events == ev).sum() < min_duration:
-                    events[events == ev] = 0
-
-    # Label connected events
-    events, n_events = ndimage.label(exceed_bool)
-
-    # Filter by duration (minimum 5 days)
-    for ev in range(1, n_events + 1):
-        if (events == ev).sum() < min_duration:
-            events[events == ev] = 0
+        # xrMHW option: bridge short gaps BEFORE the duration filter, so an
+        # otherwise-fragmented long event survives as one. This is a deliberate
+        # departure from Hobday/Oliver (documented), not the default.
+        exceed_bool = _bridge_gaps(exceed_bool, max_gap)
+        events, n_events = ndimage.label(exceed_bool)
+        events = _filter_min_duration(events, n_events, min_duration)
+    else:
+        # Hobday/Oliver default ('post-filter'): apply the duration filter FIRST,
+        # then join the surviving events across gaps <= max_gap. Joined events are
+        # >= min_duration by construction, so no second duration filter is needed.
+        events, n_events = ndimage.label(exceed_bool)
+        events = _filter_min_duration(events, n_events, min_duration)
+        if join_across_gaps:  # join_method == 'post-filter'
+            survivors = _bridge_gaps(events > 0, max_gap)
+            events, n_events = ndimage.label(survivors)
 
     # 4. Metrics Extraction
     mhw_duration = np.zeros(T, dtype=float) 
