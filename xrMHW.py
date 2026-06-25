@@ -28,50 +28,19 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 # 1. CORE SCIENTIFIC LOGIC (Numpy/Pandas based)
 # =============================================================================
 
-def _filter_min_duration(events, n_events, min_duration):
-    """Set to 0 every labeled event shorter than `min_duration` (vectorized)."""
-    if n_events == 0:
-        return events
-    counts = np.bincount(events.ravel())
-    too_short = np.nonzero(counts < min_duration)[0]
-    too_short = too_short[too_short != 0]  # never drop the background label
-    if too_short.size:
-        events = np.where(np.isin(events, too_short), 0, events)
-    return events
-
-
-def _bridge_gaps(mask, max_gap):
-    """Fill interior False runs of length <= `max_gap` so the flanking True
-    runs become a single continuous event. Leading/trailing gaps are never
-    filled (there is nothing to join them to)."""
-    mask = mask.copy()
-    gaps, n_gaps = ndimage.label(~mask)
-    if n_gaps:
-        for sl in ndimage.find_objects(gaps):
-            start, stop = sl[0].start, sl[0].stop
-            if (stop - start) <= max_gap and start > 0 and stop < len(mask):
-                mask[start:stop] = True
-    return mask
-
-
 def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window_half_width=5, 
                     smooth_pctile=True, smooth_width=31, min_duration=5, 
                     join_across_gaps=True, max_gap=2, cold_spells=False,
-                    join_method='post-filter'):
+                    compute_event_metrics=True, join_method='post-filter'):
     
     """
     Core detection algorithm for Marine Heatwaves (or Cold Spells) on a single 1D time series.
     Based on Hobday et al. (2016) marine heatwave definition. Edited and optimized from 
     https://github.com/ecjoliver/marineHeatWaves
     
-    This version reproduces the reference marineHeatWaves implementation
-    (Oliver, https://github.com/ecjoliver/marineHeatWaves) bit-for-bit in its
-    default configuration. Gap handling is selectable via `join_method`:
-      - 'post-filter' (DEFAULT, = Hobday/Oliver): apply the minimum-duration
-        filter first, then join surviving events separated by <= `max_gap` days.
-      - 'pre-filter' (xrMHW option): join short gaps BEFORE the duration filter,
-        so a fragmented long event survives as one. This is a deliberate,
-        documented departure from Hobday/Oliver, not the default.
+    This version includes a vectorized 'gap filling' mechanism that physically joins 
+    events separated by 'max_gap' days or less before applying the duration filter, 
+    ensuring fragmented events are correctly identified.
 
     Parameters
     ----------
@@ -95,9 +64,6 @@ def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window
         Whether to join events separated by a gap of `max_gap` days or less (default True).
     max_gap : int
         Maximum gap length (in days) allowed to join MHWs (default 2 days).
-    join_method : {'post-filter', 'pre-filter'}
-        Order of gap-joining relative to the duration filter (default
-        'post-filter', which matches Hobday/Oliver). See summary above.
     cold_spells : bool, optional
         If True, detects cold spells (temp < threshold). Default False.
         
@@ -137,25 +103,21 @@ def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window
     thresh_clim_year = np.full(366, np.nan)
     seas_clim_year = np.full(366, np.nan)
     
-    # Calculate threshold and climatology for each day of year (1-366).
-    # Windowing matches Oliver/Hobday exactly: for each occurrence of day-of-year
-    # `d` in the baseline, pool the +/- window_half_width CONSECUTIVE calendar days
-    # around it (index-space window), across all baseline years. This naturally
-    # includes Feb-29 data in neighbouring windows, unlike a DOY-value window.
-    clim_idx = np.flatnonzero(clim_mask)
-    cs, ce = clim_idx[0], clim_idx[-1]
-    offsets = np.arange(-window_half_width, window_half_width + 1)
+    # Calculate threshold and climatology for each day of year (1-366)
     for d in range(1, 367):
-        if d == 60:
-            continue  # Feb 29 handled by interpolation below
-        occ = np.flatnonzero(doy[cs:ce + 1] == d)
-        if occ.size == 0:  # day-of-year absent (e.g. 360-day calendars)
-            continue
-        tt = (cs + occ[:, None] + offsets[None, :]).ravel()
-        tt = tt[(tt >= 0) & (tt < T)]
-        data_in_window = temp[tt]
-        thresh_clim_year[d - 1] = np.nanpercentile(data_in_window, pctile)
-        seas_clim_year[d - 1] = np.nanmean(data_in_window)
+        if d == 60: continue # Skip Feb 29 logic placeholder initially
+        
+        # Define window (circular)
+        window_days = np.arange(d - window_half_width, d + window_half_width + 1)
+        window_days = ((window_days - 1) % 366) + 1
+        window_days = window_days[window_days != 60] # Exclude Feb 29 from window logic
+        
+        in_window = np.isin(doy_clim, window_days)
+        data_in_window = temp_clim[in_window]
+        
+        if len(data_in_window) > 0:
+            thresh_clim_year[d-1] = np.nanpercentile(data_in_window, pctile)
+            seas_clim_year[d-1] = np.nanmean(data_in_window)
 
     # Interpolate Feb 29 (DOY 60)
     thresh_clim_year[59] = 0.5 * thresh_clim_year[58] + 0.5 * thresh_clim_year[60]
@@ -183,25 +145,59 @@ def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window
         exceed_bool = temp < clim_thresh
     else:
         exceed_bool = temp > clim_thresh
-    # NaN climatology days (e.g. absent DOYs) must never count as exceedances.
-    exceed_bool = np.asarray(exceed_bool) & ~np.isnan(clim_thresh)
 
+    # Physic union before filtering (original architechture xrMHW) ---
     if join_across_gaps and join_method == 'pre-filter':
-        # xrMHW option: bridge short gaps BEFORE the duration filter, so an
-        # otherwise-fragmented long event survives as one. This is a deliberate
-        # departure from Hobday/Oliver (documented), not the default.
-        exceed_bool = _bridge_gaps(exceed_bool, max_gap)
-        events, n_events = ndimage.label(exceed_bool)
-        events = _filter_min_duration(events, n_events, min_duration)
-    else:
-        # Hobday/Oliver default ('post-filter'): apply the duration filter FIRST,
-        # then join the surviving events across gaps <= max_gap. Joined events are
-        # >= min_duration by construction, so no second duration filter is needed.
-        events, n_events = ndimage.label(exceed_bool)
-        events = _filter_min_duration(events, n_events, min_duration)
-        if join_across_gaps:  # join_method == 'post-filter'
-            survivors = _bridge_gaps(events > 0, max_gap)
-            events, n_events = ndimage.label(survivors)
+        gaps_label, n_gaps = ndimage.label(~exceed_bool)
+        if n_gaps > 0:
+            gap_slices = ndimage.find_objects(gaps_label)
+            for sl in gap_slices:
+                gap_len = sl[0].stop - sl[0].start
+                if gap_len <= max_gap and (sl[0].start > 0) and (sl[0].stop < len(temp)):
+                    exceed_bool[sl] = True
+
+    # Tag initial events
+    events, n_events = ndimage.label(exceed_bool)
+
+    # Filter minimmum duration
+    for ev in range(1, n_events + 1):
+        if (events == ev).sum() < min_duration:
+            events[events == ev] = 0
+
+    # Post-filter union (Similar to Oliver 2015) ---
+    if join_across_gaps and join_method == 'post-filter':
+    # 1. Re-etiquetamos solo los eventos que sobrevivieron al filtro de 5 días
+        events, n_events = ndimage.label(events > 0)
+        
+        if n_events > 1:
+            ev_slices = ndimage.find_objects(events)
+            # Iteramos de atrás hacia adelante para no corromper los índices al unir
+            for i in range(len(ev_slices) - 1, 0, -1):
+                # gap_start es el 'stop' del evento anterior (primer índice del gap)
+                gap_start = ev_slices[i-1][0].stop 
+                # gap_end es el 'start' del evento actual (índice donde termina el gap)
+                gap_end = ev_slices[i][0].start
+                
+                # El número de días entre eventos es simplemente la resta
+                gap_len = gap_end - gap_start 
+                
+                if gap_len <= max_gap:
+                    # Unimos físicamente rellenando con True en la máscara original
+                    exceed_bool[gap_start:gap_end] = True
+            
+            # 2. Consolidamos: Re-etiquetamos y aplicamos el filtro de duración final
+            events, n_events = ndimage.label(exceed_bool)
+            for ev in range(1, n_events + 1):
+                if (events == ev).sum() < min_duration:
+                    events[events == ev] = 0
+
+    # Label connected events
+    events, n_events = ndimage.label(exceed_bool)
+
+    # Filter by duration (minimum 5 days)
+    for ev in range(1, n_events + 1):
+        if (events == ev).sum() < min_duration:
+            events[events == ev] = 0
 
     # 4. Metrics Extraction
     mhw_duration = np.zeros(T, dtype=float) 
@@ -210,46 +206,51 @@ def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window
     mhw_intensity_cum = np.zeros(T, dtype=float)
     is_mhw = np.zeros(T, dtype=bool)
 
-    # Re-labeling is not strictly necessary for calculation but ensures sequential IDs 
-    # if some were removed during filtering. We iterate over unique surviving labels.
-    active_labels = np.unique(events)
-    active_labels = active_labels[active_labels != 0]
+    if compute_event_metrics:
+        # Iterate over unique surviving labels and compute per-event metrics.
+        active_labels = np.unique(events)
+        active_labels = active_labels[active_labels != 0]
 
-    for ev_id in active_labels:
-        idx = np.where(events == ev_id)[0]
-        dur = len(idx)
-        # Double check duration (redundant but safe)
-        if dur < min_duration: continue
-        
-        temps_ev = temp[idx]
-        seas_ev = clim_seas[idx]
-        thresh_ev = clim_thresh[idx]
-        anoms = temps_ev - seas_ev
-        
-        # Calculate Intensity (Max and Cumulative)
-        if cold_spells:
-            # Max intensity is the minimum anomaly (most negative)
-            i_max = np.min(anoms)
-            i_cum = np.sum(anoms)
-            peak_idx = np.argmin(anoms)
-        else:
-            i_max = np.max(anoms)
-            i_cum = np.sum(anoms)
-            peak_idx = np.argmax(anoms)
-        
-        # Categorization
-        intensity_diff = thresh_ev[peak_idx] - seas_ev[peak_idx]
-        if intensity_diff == 0: intensity_diff = 1e-5 
-        
-        ratio = anoms[peak_idx] / intensity_diff
-        cat = max(1, int(np.floor(ratio)))
-        
-        # Assign values to the full time dimension
-        mhw_duration[idx] = float(dur) 
-        mhw_category[idx] = float(cat)
-        mhw_intensity_max[idx] = i_max
-        mhw_intensity_cum[idx] = i_cum
-        is_mhw[idx] = True
+        for ev_id in active_labels:
+            idx = np.where(events == ev_id)[0]
+            dur = len(idx)
+            # Double check duration (redundant but safe)
+            if dur < min_duration: continue
+
+            temps_ev = temp[idx]
+            seas_ev = clim_seas[idx]
+            thresh_ev = clim_thresh[idx]
+            anoms = temps_ev - seas_ev
+
+            # Calculate Intensity (Max and Cumulative)
+            if cold_spells:
+                # Max intensity is the minimum anomaly (most negative)
+                i_max = np.min(anoms)
+                i_cum = np.sum(anoms)
+                peak_idx = np.argmin(anoms)
+            else:
+                i_max = np.max(anoms)
+                i_cum = np.sum(anoms)
+                peak_idx = np.argmax(anoms)
+
+            # Categorization
+            intensity_diff = thresh_ev[peak_idx] - seas_ev[peak_idx]
+            if intensity_diff == 0: intensity_diff = 1e-5
+
+            ratio = anoms[peak_idx] / intensity_diff
+            cat = max(1, int(np.floor(ratio)))
+
+            # Assign values to the full time dimension
+            mhw_duration[idx] = float(dur)
+            mhw_category[idx] = float(cat)
+            mhw_intensity_max[idx] = i_max
+            mhw_intensity_cum[idx] = i_cum
+            is_mhw[idx] = True
+    else:
+        # Fast path: per-event metrics not requested -> skip the loop entirely.
+        # The duration filter above already removed short events, so the set of
+        # surviving labels equals the loop's is_mhw, computed here vectorized.
+        is_mhw = (events != 0)
 
     anomaly = temp - clim_seas
     
@@ -332,7 +333,46 @@ def mhw_1d_wrapper(time_ordinal, temp, clim_start_year, clim_end_year, max_gap_i
 # 3. XARRAY INTEGRATION
 # =============================================================================
 
-def xrMHW_func(ds, temp_var_name, clim_period, **kwargs):
+def _resolve_output_vars(output_vars, prefix):
+    """Resolve requested output names to canonical dataset variable names.
+
+    Accepts canonical names ('mhw_intensity'), short aliases ('intensity',
+    'duration', 'category', 'max_intensity', 'cum_intensity', 'clim'/'climatology',
+    'thresh'/'threshold'), a single string, or a list/tuple. Returns a
+    de-duplicated, ordered list. ``output_vars=None`` returns all variables
+    (backward compatible).
+    """
+    canonical = [f'{prefix}_intensity', f'{prefix}_duration', f'{prefix}_category',
+                 f'{prefix}_max_intensity', f'{prefix}_cum_intensity', 'climatology', 'threshold']
+    if output_vars is None:
+        return list(canonical)
+    aliases = {
+        'intensity': f'{prefix}_intensity', 'duration': f'{prefix}_duration',
+        'category': f'{prefix}_category', 'max_intensity': f'{prefix}_max_intensity',
+        'cum_intensity': f'{prefix}_cum_intensity',
+        'climatology': 'climatology', 'clim': 'climatology',
+        'threshold': 'threshold', 'thresh': 'threshold',
+    }
+    if isinstance(output_vars, str):
+        output_vars = [output_vars]
+    resolved = []
+    for v in output_vars:
+        key = v.strip()
+        if key in canonical:
+            name = key
+        elif key in aliases:
+            name = aliases[key]
+        elif f'{prefix}_{key}' in canonical:
+            name = f'{prefix}_{key}'
+        else:
+            raise ValueError(f"Unknown output var '{v}'. Choose from {canonical} "
+                             f"or aliases {sorted(aliases)}.")
+        if name not in resolved:
+            resolved.append(name)
+    return resolved
+
+
+def xrMHW_func(ds, temp_var_name, clim_period, output_vars=None, **kwargs):
     """
     Applies the Marine Heatwave (MHW) or Marine Cold Spell (MCS) detection algorithm 
     over an entire Xarray Dataset using Dask for parallelization.
@@ -443,6 +483,14 @@ def xrMHW_func(ds, temp_var_name, clim_period, **kwargs):
     if 'pctile' not in func_kwargs:
         func_kwargs['pctile'] = 10 if func_kwargs['cold_spells'] else 90
 
+    # Decide whether the costly per-event metric loop is needed (Level-2 fast path):
+    # only run it if duration/category/max/cum are among the requested outputs.
+    _prefix = 'mcs' if func_kwargs['cold_spells'] else 'mhw'
+    _metric_vars = {f'{_prefix}_duration', f'{_prefix}_category',
+                    f'{_prefix}_max_intensity', f'{_prefix}_cum_intensity'}
+    func_kwargs['compute_event_metrics'] = any(
+        v in _metric_vars for v in _resolve_output_vars(output_vars, _prefix))
+
     # Define output types matching the return tuple of the core function
     # (seas, thresh, anomaly, is_mhw, duration, category, intensity_max, intensity_cum)
     output_dtypes = [np.float32, np.float32, np.float32, bool, np.float32, np.float32, np.float32, np.float32]
@@ -467,23 +515,28 @@ def xrMHW_func(ds, temp_var_name, clim_period, **kwargs):
 
     # 4. Assemble Output Dataset
     ds_out = xr.Dataset()
-    
-    # Determine prefix based on event type for scientifically accurate variable names
+
+    # Determine prefix based on event type (mhw / mcs)
     prefix = 'mcs' if func_kwargs['cold_spells'] else 'mhw'
 
-    # Apply Mask: Variables are filled with NaNs where no event is detected.
-    # This significantly reduces storage size and simplifies downstream plotting.
-    ds_out[f'{prefix}_intensity'] = anomaly.where(is_mhw)
-    ds_out[f'{prefix}_duration'] = duration.where(is_mhw)
-    ds_out[f'{prefix}_category'] = category.where(is_mhw)
-    ds_out[f'{prefix}_max_intensity'] = intensity_max.where(is_mhw)
-    ds_out[f'{prefix}_cum_intensity'] = intensity_cum.where(is_mhw)
-    
-    # Climatology and Threshold exist for all time steps
-    ds_out['climatology'] = seas
-    ds_out['threshold'] = thresh
+    # All available output fields (lazy). Event metrics are NaN-masked where no
+    # event is detected (also compresses well on disk).
+    available = {
+        f'{prefix}_intensity': anomaly.where(is_mhw),
+        f'{prefix}_duration': duration.where(is_mhw),
+        f'{prefix}_category': category.where(is_mhw),
+        f'{prefix}_max_intensity': intensity_max.where(is_mhw),
+        f'{prefix}_cum_intensity': intensity_cum.where(is_mhw),
+        'climatology': seas,
+        'threshold': thresh,
+    }
 
-    # Preserve original coordinates (lat, lon, depth, etc.) from the input dataset
+    # Select which fields to keep (output_vars=None -> all; backward compatible)
+    selected = _resolve_output_vars(output_vars, prefix)
+    for _name in selected:
+        ds_out[_name] = available[_name]
+
+    # Preserve original coordinates (lat, lon, depth, etc.)
     ds_out = ds_out.assign_coords(ds.coords)
     
     # Copy attributes to retain metadata (units, long_name, etc.)
