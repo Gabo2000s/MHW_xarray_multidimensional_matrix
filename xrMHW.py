@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window_half_width=5, 
                     smooth_pctile=True, smooth_width=31, min_duration=5, 
                     join_across_gaps=True, max_gap=2, cold_spells=False,
-                    join_method='post-filter'):
+                    compute_event_metrics=True, join_method='post-filter'):
     
     """
     Core detection algorithm for Marine Heatwaves (or Cold Spells) on a single 1D time series.
@@ -206,46 +206,51 @@ def detect_mhw_core(t_ordinal, temp, clim_period=(None, None), pctile=90, window
     mhw_intensity_cum = np.zeros(T, dtype=float)
     is_mhw = np.zeros(T, dtype=bool)
 
-    # Re-labeling is not strictly necessary for calculation but ensures sequential IDs 
-    # if some were removed during filtering. We iterate over unique surviving labels.
-    active_labels = np.unique(events)
-    active_labels = active_labels[active_labels != 0]
+    if compute_event_metrics:
+        # Iterate over unique surviving labels and compute per-event metrics.
+        active_labels = np.unique(events)
+        active_labels = active_labels[active_labels != 0]
 
-    for ev_id in active_labels:
-        idx = np.where(events == ev_id)[0]
-        dur = len(idx)
-        # Double check duration (redundant but safe)
-        if dur < min_duration: continue
-        
-        temps_ev = temp[idx]
-        seas_ev = clim_seas[idx]
-        thresh_ev = clim_thresh[idx]
-        anoms = temps_ev - seas_ev
-        
-        # Calculate Intensity (Max and Cumulative)
-        if cold_spells:
-            # Max intensity is the minimum anomaly (most negative)
-            i_max = np.min(anoms)
-            i_cum = np.sum(anoms)
-            peak_idx = np.argmin(anoms)
-        else:
-            i_max = np.max(anoms)
-            i_cum = np.sum(anoms)
-            peak_idx = np.argmax(anoms)
-        
-        # Categorization
-        intensity_diff = thresh_ev[peak_idx] - seas_ev[peak_idx]
-        if intensity_diff == 0: intensity_diff = 1e-5 
-        
-        ratio = anoms[peak_idx] / intensity_diff
-        cat = max(1, int(np.floor(ratio)))
-        
-        # Assign values to the full time dimension
-        mhw_duration[idx] = float(dur) 
-        mhw_category[idx] = float(cat)
-        mhw_intensity_max[idx] = i_max
-        mhw_intensity_cum[idx] = i_cum
-        is_mhw[idx] = True
+        for ev_id in active_labels:
+            idx = np.where(events == ev_id)[0]
+            dur = len(idx)
+            # Double check duration (redundant but safe)
+            if dur < min_duration: continue
+
+            temps_ev = temp[idx]
+            seas_ev = clim_seas[idx]
+            thresh_ev = clim_thresh[idx]
+            anoms = temps_ev - seas_ev
+
+            # Calculate Intensity (Max and Cumulative)
+            if cold_spells:
+                # Max intensity is the minimum anomaly (most negative)
+                i_max = np.min(anoms)
+                i_cum = np.sum(anoms)
+                peak_idx = np.argmin(anoms)
+            else:
+                i_max = np.max(anoms)
+                i_cum = np.sum(anoms)
+                peak_idx = np.argmax(anoms)
+
+            # Categorization
+            intensity_diff = thresh_ev[peak_idx] - seas_ev[peak_idx]
+            if intensity_diff == 0: intensity_diff = 1e-5
+
+            ratio = anoms[peak_idx] / intensity_diff
+            cat = max(1, int(np.floor(ratio)))
+
+            # Assign values to the full time dimension
+            mhw_duration[idx] = float(dur)
+            mhw_category[idx] = float(cat)
+            mhw_intensity_max[idx] = i_max
+            mhw_intensity_cum[idx] = i_cum
+            is_mhw[idx] = True
+    else:
+        # Fast path: per-event metrics not requested -> skip the loop entirely.
+        # The duration filter above already removed short events, so the set of
+        # surviving labels equals the loop's is_mhw, computed here vectorized.
+        is_mhw = (events != 0)
 
     anomaly = temp - clim_seas
     
@@ -477,6 +482,14 @@ def xrMHW_func(ds, temp_var_name, clim_period, output_vars=None, **kwargs):
     # Auto-set default percentile: 90th for Heatwaves, 10th for Cold Spells
     if 'pctile' not in func_kwargs:
         func_kwargs['pctile'] = 10 if func_kwargs['cold_spells'] else 90
+
+    # Decide whether the costly per-event metric loop is needed (Level-2 fast path):
+    # only run it if duration/category/max/cum are among the requested outputs.
+    _prefix = 'mcs' if func_kwargs['cold_spells'] else 'mhw'
+    _metric_vars = {f'{_prefix}_duration', f'{_prefix}_category',
+                    f'{_prefix}_max_intensity', f'{_prefix}_cum_intensity'}
+    func_kwargs['compute_event_metrics'] = any(
+        v in _metric_vars for v in _resolve_output_vars(output_vars, _prefix))
 
     # Define output types matching the return tuple of the core function
     # (seas, thresh, anomaly, is_mhw, duration, category, intensity_max, intensity_cum)
